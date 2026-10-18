@@ -1,0 +1,205 @@
+name: Build mod
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.4.1
+
+      - name: Generate project files
+        run: |
+          mkdir -p src/main/java/com/example/paybuttons src/main/resources
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          rootProject.name = 'paybuttons'
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+
+          minecraft_version=26.1.2
+          loader_version=0.19.3
+          fabric_version=0.152.1+26.1.2
+
+          mod_version=1.0.0
+          maven_group=com.example
+          archives_base_name=paybuttons
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'net.fabricmc.fabric-loom' version '1.16-SNAPSHOT'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") {
+                  expand "version": project.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 25
+          }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_25
+              targetCompatibility = JavaVersion.VERSION_25
+          }
+          EOF
+          cat > src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "paybuttons",
+            "version": "${version}",
+            "name": "Pay Buttons",
+            "description": "Adds payback, 2x and bal buttons to payment messages.",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["com.example.paybuttons.PayButtonsClient"]
+            },
+            "depends": {
+              "fabricloader": ">=0.19.2",
+              "minecraft": ">=26.1",
+              "java": ">=25",
+              "fabric-api": "*"
+            }
+          }
+          EOF
+          cat > src/main/java/com/example/paybuttons/PayButtonsClient.java <<'EOF'
+          package com.example.paybuttons;
+
+          import com.mojang.brigadier.arguments.StringArgumentType;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
+          import net.minecraft.ChatFormatting;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.network.chat.ClickEvent;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.network.chat.HoverEvent;
+          import net.minecraft.network.chat.MutableComponent;
+
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+
+          public class PayButtonsClient implements ClientModInitializer {
+
+              // Matches: ".Jamestus3850 paid you $10M"
+              private static final Pattern PAID = Pattern.compile(
+                      "^(\\.?[A-Za-z0-9_]{1,16}) paid you \\$?([\\d,]*\\.?\\d+)\\s*([KMBTkmbt]?)");
+
+              // Delay between the two payments in [2x] (ticks, 20 ticks = 1 second)
+              private static final int DELAY_TICKS = 10;
+
+              private static String pendingCommand = null;
+              private static int pendingTicks = 0;
+
+              @Override
+              public void onInitializeClient() {
+                  ClientReceiveMessageEvents.MODIFY_GAME.register((message, overlay) -> {
+                      if (overlay) return message;
+
+                      Matcher m = PAID.matcher(message.getString().trim());
+                      if (!m.find()) return message;
+
+                      String name = m.group(1);
+                      String amount = m.group(2).replace(",", "") + m.group(3).toUpperCase();
+
+                      MutableComponent out = message.copy();
+                      out.append(Component.literal(" "));
+                      out.append(button("[payback]", ChatFormatting.GREEN,
+                              "/pay " + name + " " + amount, "/pay " + name + " " + amount));
+                      out.append(Component.literal(" "));
+                      out.append(button("[2x]", ChatFormatting.GOLD,
+                              "/paybuttons_twice " + name + " " + amount,
+                              "/pay " + name + " " + amount + "  (sent 2 times)"));
+                      out.append(Component.literal(" "));
+                      out.append(button("[bal]", ChatFormatting.LIGHT_PURPLE,
+                              "/bal " + name, "/bal " + name));
+                      return out;
+                  });
+
+                  ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
+                          dispatcher.register(ClientCommands.literal("paybuttons_twice")
+                                  .then(ClientCommands.argument("name", StringArgumentType.word())
+                                          .then(ClientCommands.argument("amount", StringArgumentType.word())
+                                                  .executes(ctx -> {
+                                                      String name = StringArgumentType.getString(ctx, "name");
+                                                      String amount = StringArgumentType.getString(ctx, "amount");
+                                                      String cmd = "pay " + name + " " + amount;
+
+                                                      Minecraft mc = Minecraft.getInstance();
+                                                      if (mc.getConnection() == null) return 0;
+
+                                                      if (pendingCommand != null) {
+                                                          mc.getConnection().sendCommand(pendingCommand);
+                                                      }
+
+                                                      mc.getConnection().sendCommand(cmd);
+                                                      pendingCommand = cmd;
+                                                      pendingTicks = DELAY_TICKS;
+                                                      return 1;
+                                                  })))));
+
+                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
+                      if (pendingCommand != null && --pendingTicks <= 0) {
+                          if (client.getConnection() != null) {
+                              client.getConnection().sendCommand(pendingCommand);
+                          }
+                          pendingCommand = null;
+                      }
+                  });
+              }
+
+              private static Component button(String label, ChatFormatting color, String command, String hover) {
+                  return Component.literal(label).withStyle(style -> style
+                          .withColor(color)
+                          .withBold(true)
+                          .withClickEvent(new ClickEvent.RunCommand(command))
+                          .withHoverEvent(new HoverEvent.ShowText(Component.literal(hover))));
+              }
+          }
+          EOF
+
+      - name: Build
+        run: gradle build --no-daemon
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: paybuttons-jar
+          path: build/libs/*.jar
